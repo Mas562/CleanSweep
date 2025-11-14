@@ -3,8 +3,16 @@ from tkinter import ttk, messagebox
 import os
 import fnmatch
 from pathlib import Path
+import sys
 
-# Цвета
+# === Платформа ===
+IS_WINDOWS = sys.platform == "win32"
+
+# === Импорты для Windows ===
+if IS_WINDOWS:
+    import winreg
+
+# === Цвета ===
 BG_COLOR = "#f9fafb"
 ACCENT_COLOR = "#4f46e5"
 TEXT_COLOR = "#111827"
@@ -13,7 +21,7 @@ WARNING_COLOR = "#dc2626"
 SAFE_COLOR = "#059669"
 CARD_BG = "#ffffff"
 
-# Паттерны
+# === Паттерны мусора ===
 SAFE_PATTERNS = ["*.tmp", "*.temp", "*.log", "*.bak", "*~", ".DS_Store", "Thumbs.db", "desktop.ini"]
 SAFE_DIRS = ["__pycache__"]
 RISKY_PATTERNS = ["*.py", "*.ipynb", "*.js", "*.ts", "*.json", "*.yaml", "*.yml", "requirements.txt", "package.json", "Dockerfile", ".env", "Makefile"]
@@ -68,13 +76,77 @@ def scan_home(max_items=150):
         pass
     return garbage
 
-# === Анимированный индикатор ===
+# === Автозагрузка (Windows) ===
+def get_startup_apps():
+    if not IS_WINDOWS:
+        return []
+    apps = []
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
+        i = 0
+        while True:
+            try:
+                name, value, _ = winreg.EnumValue(key, i)
+                apps.append({"name": name, "path": value, "enabled": True})
+                i += 1
+            except OSError:
+                break
+        winreg.CloseKey(key)
+    except Exception:
+        pass
+
+    try:
+        startup_path = os.path.expandvars(r"%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup")
+        if os.path.exists(startup_path):
+            for item in os.listdir(startup_path):
+                full_path = os.path.join(startup_path, item)
+                if os.path.isfile(full_path) and item.endswith(('.lnk', '.exe', '.bat', '.cmd')):
+                    apps.append({
+                        "name": os.path.splitext(item)[0],
+                        "path": full_path,
+                        "enabled": True,
+                        "type": "shortcut"
+                    })
+    except Exception:
+        pass
+
+    return apps
+
+def toggle_startup_app(name, path, enable, is_shortcut=False):
+    if not IS_WINDOWS:
+        return False
+    try:
+        if is_shortcut:
+            if enable:
+                new_path = path.replace(".disabled", "")
+                if os.path.exists(new_path):
+                    return False
+                os.rename(path, new_path)
+            else:
+                disabled_path = path + ".disabled"
+                os.rename(path, disabled_path)
+            return True
+        else:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_WRITE)
+            if enable:
+                winreg.SetValueEx(key, name, 0, winreg.REG_SZ, path)
+            else:
+                try:
+                    winreg.DeleteValue(key, name)
+                except FileNotFoundError:
+                    pass
+            winreg.CloseKey(key)
+            return True
+    except Exception:
+        return False
+
+# === Анимация ===
 class AnimatedSpinner:
     def __init__(self, parent, text="Сканирование…"):
         self.parent = parent
         self.text = text
         self.label = ttk.Label(parent, text="", foreground=ACCENT_COLOR, font=("Segoe UI", 11))
-        self.frames = ["🔍", "🌀", "🔍", "🔍"]  # простая анимация
+        self.frames = ["🔍", "🌀", "🔍", "🔍"]
         self.idx = 0
         self.running = False
 
@@ -95,7 +167,7 @@ class AnimatedSpinner:
             self.idx = (self.idx + 1) % len(self.frames)
             self.parent.after(300, self._animate)
 
-# === Прокручиваемый фрейм без лагов ===
+# === Прокручиваемый фрейм ===
 class ScrolledFrame(ttk.Frame):
     def __init__(self, parent, *args, **kwargs):
         super().__init__(parent, *args, **kwargs)
@@ -114,7 +186,6 @@ class ScrolledFrame(ttk.Frame):
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scrollbar.pack(side="right", fill="y")
 
-        # Привязка колеса мыши
         self.bind_all("<MouseWheel>", self._on_mousewheel)
         self.bind_all("<Button-4>", self._on_mousewheel)
         self.bind_all("<Button-5>", self._on_mousewheel)
@@ -139,9 +210,9 @@ class CleanSweepApp:
         self.root.configure(bg=BG_COLOR)
         self.items = {"safe": [], "risky": []}
         self.vars = {"safe": [], "risky": []}
+        self.startup_apps = []
         self.current_view = "risky"
 
-        # Стиль
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("TFrame", background=BG_COLOR)
@@ -152,33 +223,30 @@ class CleanSweepApp:
         style.configure("TLabel", background=BG_COLOR, foreground=TEXT_COLOR)
         style.configure("Card.TFrame", background=CARD_BG)
 
-        # Заголовок
         header = ttk.Frame(root)
         header.pack(fill=tk.X, padx=40, pady=(20, 10))
         ttk.Label(header, text="🧹 CleanSweep", style="Header.TLabel").pack()
-        ttk.Label(header, text="Очистка временных файлов в вашем домашнем каталоге", foreground=MUTED_COLOR).pack()
+        ttk.Label(header, text="Очистка временных файлов и управление автозагрузкой", foreground=MUTED_COLOR).pack()
 
-        # Кнопка сканирования
         self.scan_btn = ttk.Button(root, text="Начать сканирование", command=self.start_scan, style="Accent.TButton")
         self.scan_btn.pack(pady=10)
 
-        # Анимация
         self.spinner = AnimatedSpinner(root, text="Анализ файловой системы…")
         self.spinner.pack()
 
-        # Вкладки
         tab_frame = ttk.Frame(root)
         tab_frame.pack(pady=(0, 10))
         self.risky_btn = ttk.Button(tab_frame, text="⚠️ Важные файлы", command=lambda: self.switch_view("risky"))
         self.safe_btn = ttk.Button(tab_frame, text="✅ Безопасный мусор", command=lambda: self.switch_view("safe"))
+        self.startup_btn = ttk.Button(tab_frame, text="🚀 Автозагрузка", command=self.show_startup)
         self.risky_btn.pack(side=tk.LEFT, padx=5)
         self.safe_btn.pack(side=tk.LEFT, padx=5)
+        if IS_WINDOWS:
+            self.startup_btn.pack(side=tk.LEFT, padx=5)
 
-        # Список с прокруткой
         self.list_container = ScrolledFrame(root)
         self.list_container.pack(fill=tk.BOTH, expand=True, padx=40, pady=(0, 20))
 
-        # Нижняя панель
         bottom = ttk.Frame(root)
         bottom.pack(fill=tk.X, padx=40, pady=(0, 20))
         self.status = ttk.Label(bottom, text="Готово к сканированию", foreground=MUTED_COLOR)
@@ -190,7 +258,7 @@ class CleanSweepApp:
         self.scan_btn.config(state=tk.DISABLED)
         self.spinner.start()
         self.status.config(text="Сканирование запущено…")
-        self.root.after(200, self.perform_scan)  # небольшая задержка для плавности
+        self.root.after(200, self.perform_scan)
 
     def perform_scan(self):
         self.items = scan_home()
@@ -243,6 +311,53 @@ class CleanSweepApp:
         if len(items) > 100:
             extra = ttk.Label(self.list_container.scrollable_frame, text="… список сокращён для удобства", foreground=MUTED_COLOR)
             extra.pack(pady=(10, 0))
+
+    def show_startup(self):
+        if not IS_WINDOWS:
+            messagebox.showinfo("Инфо", "Управление автозагрузкой доступно только на Windows.")
+            return
+
+        self.list_container.clear()
+        self.startup_apps = get_startup_apps()
+
+        if not self.startup_apps:
+            label = ttk.Label(self.list_container.scrollable_frame, text="Автозагрузка пуста", foreground=MUTED_COLOR, font=("Segoe UI", 11))
+            label.pack(pady=30)
+            return
+
+        info = ttk.Label(self.list_container.scrollable_frame, text=f"Программ в автозагрузке: {len(self.startup_apps)}", foreground=MUTED_COLOR)
+        info.pack(anchor=tk.W, padx=10, pady=(0, 10))
+
+        for app in self.startup_apps:
+            card = ttk.Frame(self.list_container.scrollable_frame, style="Card.TFrame")
+            card.pack(fill=tk.X, padx=10, pady=4, ipady=6)
+
+            status = "✔️ Включено" if app.get("enabled", True) else "⛔ Отключено"
+            status_color = SAFE_COLOR if app.get("enabled", True) else MUTED_COLOR
+            status_label = ttk.Label(card, text=status, foreground=status_color, font=("Segoe UI", 9, "bold"))
+            status_label.pack(side=tk.LEFT, padx=(0, 12))
+
+            name_label = tk.Label(card, text=app["name"], bg=CARD_BG, fg=TEXT_COLOR, font=("Segoe UI", 10, "bold"))
+            name_label.pack(anchor=tk.W, padx=(0, 10))
+
+            path_label = tk.Label(card, text=app["path"], bg=CARD_BG, fg=MUTED_COLOR, font=("Segoe UI", 9))
+            path_label.pack(anchor=tk.W, padx=(0, 10))
+
+            is_shortcut = app.get("type") == "shortcut"
+            if app.get("enabled", True):
+                btn = ttk.Button(card, text="Отключить", command=lambda a=app, s=is_shortcut: self.toggle_app(a, False, s))
+            else:
+                btn = ttk.Button(card, text="Включить", command=lambda a=app, s=is_shortcut: self.toggle_app(a, True, s))
+            btn.pack(side=tk.RIGHT, padx=(0, 10))
+
+    def toggle_app(self, app, enable, is_shortcut):
+        success = toggle_startup_app(app["name"], app["path"], enable, is_shortcut)
+        if success:
+            self.show_startup()
+            action = "включена" if enable else "отключена"
+            messagebox.showinfo("Готово", f"Программа «{app['name']}» {action} в автозагрузке.")
+        else:
+            messagebox.showerror("Ошибка", "Не удалось изменить автозагрузку.")
 
     def delete_selected(self):
         to_delete = []
